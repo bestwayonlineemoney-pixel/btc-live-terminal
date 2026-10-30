@@ -1,5 +1,3 @@
-Plaintext
-streamlit
 requests
 pandas
 numpy
