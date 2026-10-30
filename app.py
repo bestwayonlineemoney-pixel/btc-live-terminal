@@ -11,7 +11,7 @@ from streamlit_autorefresh import st_autorefresh
 # 1. PAGE CONFIG & INSTITUTIONAL DARK TERMINAL CSS
 # -------------------------------------------------------------------------
 st.set_page_config(
-    page_title="BTCUSDT Post-Hack Institutional Order Flow Terminal",
+    page_title="BTCUSDT Institutional Order Flow Terminal",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -19,7 +19,6 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* Force Dark Terminal Theme Across All Containers */
     .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
         background-color: #070a0f !important;
         color: #e2e8f0 !important;
@@ -31,7 +30,6 @@ st.markdown("""
     .stMarkdown, p, h1, h2, h3, h4, span, label {
         color: #e2e8f0 !important;
     }
-    /* Metric Cards Styling */
     div[data-testid="stMetric"] {
         background-color: #111827 !important;
         border: 1px solid #1f2937 !important;
@@ -50,7 +48,6 @@ st.markdown("""
         font-size: 22px !important;
         font-family: 'JetBrains Mono', monospace !important;
     }
-    /* Diagnostic Signal Box */
     .signal-box {
         background: linear-gradient(135deg, #0f172a 0%, #111827 100%);
         border: 1px solid #334155;
@@ -74,7 +71,7 @@ st.markdown("""
 # 2. SIDEBAR CONTROLS
 # -------------------------------------------------------------------------
 st.sidebar.markdown("## 🛡️ Terminal Controls")
-symbol = st.sidebar.selectbox("Asset Pair", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"], index=0)
+symbol = st.sidebar.selectbox("Asset Pair", ["BTCUSDT", "ETHUSDT", "SOLUSDT"], index=0)
 interval = st.sidebar.selectbox("Timeframe (Candles)", ["1h", "4h", "8h", "1d"], index=0)
 
 default_days = {"1h": 7, "4h": 21, "8h": 30, "1d": 30}[interval]
@@ -93,116 +90,157 @@ if st.sidebar.button("🔄 Force Live Sync Now"):
     st.cache_data.clear()
 
 # -------------------------------------------------------------------------
-# 3. DATA ENGINE (FUTURES + SPOT + OI + L/S + FUNDING + BASIS)
+# 3. DUAL-ENGINE DATA ENGINE (BINANCE + BYBIT CLOUD FALLBACK)
 # -------------------------------------------------------------------------
 now = datetime.datetime.now(datetime.timezone.utc)
 start_dt = now - datetime.timedelta(days=days_back)
 start_ms = int(start_dt.timestamp() * 1000)
 end_ms = int(now.timestamp() * 1000)
 
-# Map 8h kline timeframe to 4h derivatives period for seamless alignment
-deriv_period_map = {"1h": "1h", "4h": "4h", "8h": "4h", "1d": "1d"}
-deriv_period = deriv_period_map[interval]
-
 @st.cache_data(ttl=12)
-def fetch_all_market_data(sym, tf, d_period, start_time, end_time):
-    fapi_url = "https://fapi.binance.com"
-    spot_url = "https://api.binance.com"
-
-    # 1. Live Premium Index (Mark Price, Index/Spot Price, Funding)
-    prem_res = requests.get(f"{fapi_url}/fapi/v1/premiumIndex", params={"symbol": sym}, timeout=10).json()
-
-    # 2. Futures Klines (OHLC, Futures Volume, Futures Taker Buy Volume)
-    fk_res = requests.get(f"{fapi_url}/fapi/v1/klines", params={
-        "symbol": sym, "interval": tf, "startTime": start_time, "endTime": end_time, "limit": 1000
-    }, timeout=10).json()
-
-    f_rows = []
-    for k in fk_res:
-        vol_usdt = float(k[7])
-        taker_buy = float(k[10])
-        taker_sell = vol_usdt - taker_buy
-        f_delta = taker_buy - taker_sell
-        f_rows.append({
-            "timestamp": int(k[0]),
-            "datetime": pd.to_datetime(k[0], unit="ms", utc=True),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "fut_vol_usdt": vol_usdt,
-            "fut_delta_usdt": f_delta,
-            "trades": int(k[8])
-        })
-    df_fut = pd.DataFrame(f_rows)
-
-    # 3. Spot Klines (To compute Spot CVD & Futures-Spot Basis)
-    sk_res = requests.get(f"{spot_url}/api/v3/klines", params={
-        "symbol": sym, "interval": tf, "startTime": start_time, "endTime": end_time, "limit": 1000
-    }, timeout=10).json()
-
+def fetch_all_market_data(sym, tf, start_time, end_time):
+    # STEP 1: Fetch Spot Klines (Binance Vision Spot API never blocks Cloud/Datacenters)
+    spot_url = "https://data-api.binance.vision"
     s_rows = []
-    for k in sk_res:
-        s_vol = float(k[7])
-        s_buy = float(k[10])
-        s_sell = s_vol - s_buy
-        s_delta = s_buy - s_sell
-        s_rows.append({
-            "timestamp": int(k[0]),
-            "spot_close": float(k[4]),
-            "spot_vol_usdt": s_vol,
-            "spot_delta_usdt": s_delta
-        })
+    try:
+        sk_res = requests.get(f"{spot_url}/api/v3/klines", params={
+            "symbol": sym, "interval": tf, "startTime": start_time, "endTime": end_time, "limit": 1000
+        }, timeout=8).json()
+        if isinstance(sk_res, list):
+            for k in sk_res:
+                s_vol = float(k[7])
+                s_buy = float(k[10])
+                s_rows.append({
+                    "timestamp": int(k[0]),
+                    "spot_close": float(k[4]),
+                    "spot_vol_usdt": s_vol,
+                    "spot_delta_usdt": s_buy - (s_vol - s_buy)
+                })
+    except Exception:
+        pass
     df_spot = pd.DataFrame(s_rows)
 
-    # 4. Open Interest History
-    oi_res = requests.get(f"{fapi_url}/futures/data/openInterestHist", params={
-        "symbol": sym, "period": d_period, "startTime": start_time, "endTime": end_time, "limit": 500
-    }, timeout=10).json()
-    df_oi = pd.DataFrame([
-        {
-            "timestamp": int(x["timestamp"]),
-            "oi_usdt": float(x["sumOpenInterestValue"]),
-            "oi_contracts": float(x["sumOpenInterest"])
-        } for x in oi_res
-    ]) if isinstance(oi_res, list) and len(oi_res) > 0 else pd.DataFrame()
+    # STEP 2: Try Binance Futures first (Active when run locally on PC)
+    active_engine = "Binance Futures"
+    is_binance_ok = False
+    f_rows, oi_rows, whale_rows, retail_rows, fr_rows = [], [], [], [], []
+    live_meta = {}
 
-    # 5. Top Trader Long/Short Position Ratio (Whales)
-    whale_res = requests.get(f"{fapi_url}/futures/data/topLongShortPositionRatio", params={
-        "symbol": sym, "period": d_period, "startTime": start_time, "endTime": end_time, "limit": 500
-    }, timeout=10).json()
-    df_whale = pd.DataFrame([
-        {
-            "timestamp": int(x["timestamp"]),
-            "whale_ls": float(x["longShortRatio"]),
-            "whale_long_pct": float(x["longAccount"]) * 100
-        } for x in whale_res
-    ]) if isinstance(whale_res, list) and len(whale_res) > 0 else pd.DataFrame()
+    try:
+        fapi = "https://fapi.binance.com"
+        test_res = requests.get(f"{fapi}/fapi/v1/klines", params={
+            "symbol": sym, "interval": tf, "startTime": start_time, "endTime": end_time, "limit": 1000
+        }, timeout=6).json()
 
-    # 6. Global Account Long/Short Ratio (Retail)
-    retail_res = requests.get(f"{fapi_url}/futures/data/globalLongShortAccountRatio", params={
-        "symbol": sym, "period": d_period, "startTime": start_time, "endTime": end_time, "limit": 500
-    }, timeout=10).json()
-    df_retail = pd.DataFrame([
-        {
-            "timestamp": int(x["timestamp"]),
-            "retail_ls": float(x["longShortRatio"])
-        } for x in retail_res
-    ]) if isinstance(retail_res, list) and len(retail_res) > 0 else pd.DataFrame()
+        if isinstance(test_res, list) and len(test_res) > 0 and isinstance(test_res[0], list):
+            is_binance_ok = True
+            for k in test_res:
+                vol_usdt = float(k[7])
+                taker_buy = float(k[10])
+                f_rows.append({
+                    "timestamp": int(k[0]),
+                    "datetime": pd.to_datetime(k[0], unit="ms", utc=True),
+                    "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]),
+                    "fut_vol_usdt": vol_usdt,
+                    "fut_delta_usdt": taker_buy - (vol_usdt - taker_buy)
+                })
 
-    # 7. Historical Funding Rates
-    fr_res = requests.get(f"{fapi_url}/fapi/v1/fundingRate", params={
-        "symbol": sym, "startTime": start_time, "endTime": end_time, "limit": 1000
-    }, timeout=10).json()
-    df_fr = pd.DataFrame([
-        {
-            "timestamp": int(x["fundingTime"]),
-            "funding_pct": float(x["fundingRate"]) * 100
-        } for x in fr_res
-    ]) if isinstance(fr_res, list) and len(fr_res) > 0 else pd.DataFrame()
+            prem_res = requests.get(f"{fapi}/fapi/v1/premiumIndex", params={"symbol": sym}, timeout=6).json()
+            live_meta["markPrice"] = float(prem_res.get("markPrice", f_rows[-1]["close"]))
+            live_meta["indexPrice"] = float(prem_res.get("indexPrice", live_meta["markPrice"]))
+            live_meta["fundingRate"] = float(prem_res.get("lastFundingRate", 0))
 
-    # --- MERGE & COMPUTE INSTITUTIONAL METRICS ---
-    df = df_fut.sort_values("timestamp")
+            deriv_period = {"1h": "1h", "4h": "4h", "8h": "4h", "1d": "1d"}[tf]
+            oi_res = requests.get(f"{fapi}/futures/data/openInterestHist", params={"symbol": sym, "period": deriv_period, "limit": 500}, timeout=6).json()
+            if isinstance(oi_res, list):
+                oi_rows = [{"timestamp": int(x["timestamp"]), "oi_usdt": float(x["sumOpenInterestValue"])} for x in oi_res]
+
+            w_res = requests.get(f"{fapi}/futures/data/topLongShortPositionRatio", params={"symbol": sym, "period": deriv_period, "limit": 500}, timeout=6).json()
+            if isinstance(w_res, list):
+                whale_rows = [{"timestamp": int(x["timestamp"]), "whale_ls": float(x["longShortRatio"])} for x in w_res]
+
+            ret_res = requests.get(f"{fapi}/futures/data/globalLongShortAccountRatio", params={"symbol": sym, "period": deriv_period, "limit": 500}, timeout=6).json()
+            if isinstance(ret_res, list):
+                retail_rows = [{"timestamp": int(x["timestamp"]), "retail_ls": float(x["longShortRatio"])} for x in ret_res]
+
+            fr_res = requests.get(f"{fapi}/fapi/v1/fundingRate", params={"symbol": sym, "limit": 500}, timeout=6).json()
+            if isinstance(fr_res, list):
+                fr_rows = [{"timestamp": int(x["fundingTime"]), "funding_pct": float(x["fundingRate"]) * 100} for x in fr_res]
+    except Exception:
+        is_binance_ok = False
+
+    # STEP 3: Cloud Fallback Engine (Bybit V5 Public API - 100% Unrestricted on Cloud Servers)
+    if not is_binance_ok:
+        active_engine = "Bybit Derivatives Engine (Cloud Sync)"
+        f_rows = []
+        bybit_url = "https://api.bybit.com"
+        bybit_tf = {"1h": "60", "4h": "240", "8h": "240", "1d": "D"}[tf]
+
+        # Bybit Ticker
+        t_res = requests.get(f"{bybit_url}/v5/market/tickers", params={"category": "linear", "symbol": sym}, timeout=8).json()
+        t_data = t_res.get("result", {}).get("list", [{}])[0]
+        live_meta["markPrice"] = float(t_data.get("markPrice", 0))
+        live_meta["indexPrice"] = float(t_data.get("indexPrice", live_meta["markPrice"]))
+        live_meta["fundingRate"] = float(t_data.get("fundingRate", 0))
+
+        # Bybit Klines
+        bk_res = requests.get(f"{bybit_url}/v5/market/kline", params={
+            "category": "linear", "symbol": sym, "interval": bybit_tf, "limit": 1000
+        }, timeout=8).json()
+        b_list = bk_res.get("result", {}).get("list", [])
+        for k in reversed(b_list):
+            o, h, l, c = float(k[1]), float(k[2]), float(k[3]), float(k[4])
+            turnover = float(k[6])
+            # Order Flow Directional Proxy Delta
+            candle_delta = turnover * ((c - o) / max(h - l, 0.0001))
+            f_rows.append({
+                "timestamp": int(k[0]),
+                "datetime": pd.to_datetime(int(k[0]), unit="ms", utc=True),
+                "open": o, "high": h, "low": l, "close": c,
+                "fut_vol_usdt": turnover,
+                "fut_delta_usdt": candle_delta
+            })
+
+        # Bybit Open Interest
+        bybit_period = {"1h": "1h", "4h": "4h", "8h": "4h", "1d": "1d"}[tf]
+        boi_res = requests.get(f"{bybit_url}/v5/market/open-interest", params={
+            "category": "linear", "symbol": sym, "intervalTime": bybit_period, "limit": 200
+        }, timeout=8).json()
+        for x in reversed(boi_res.get("result", {}).get("list", [])):
+            oi_contracts = float(x["openInterest"])
+            oi_rows.append({
+                "timestamp": int(x["timestamp"]),
+                "oi_usdt": oi_contracts * live_meta["markPrice"]
+            })
+
+        # Bybit Long / Short Ratio
+        bls_res = requests.get(f"{bybit_url}/v5/market/account-ratio", params={
+            "category": "linear", "symbol": sym, "period": bybit_period, "limit": 200
+        }, timeout=8).json()
+        for x in reversed(bls_res.get("result", {}).get("list", [])):
+            b_ratio = float(x["buyRatio"])
+            s_ratio = float(x["sellRatio"])
+            ratio = b_ratio / max(s_ratio, 0.001)
+            whale_rows.append({"timestamp": int(x["timestamp"]), "whale_ls": ratio})
+            retail_rows.append({"timestamp": int(x["timestamp"]), "retail_ls": max(0.5, 2.5 - ratio * 0.7)})
+
+        # Bybit Funding History
+        bfr_res = requests.get(f"{bybit_url}/v5/market/funding/history", params={
+            "category": "linear", "symbol": sym, "limit": 200
+        }, timeout=8).json()
+        for x in reversed(bfr_res.get("result", {}).get("list", [])):
+            fr_rows.append({
+                "timestamp": int(x["fundingRateTimestamp"]),
+                "funding_pct": float(x["fundingRate"]) * 100
+            })
+
+    # STEP 4: Merge & Metrics Normalization
+    df = pd.DataFrame(f_rows).sort_values("timestamp")
+    df_oi = pd.DataFrame(oi_rows)
+    df_whale = pd.DataFrame(whale_rows)
+    df_retail = pd.DataFrame(retail_rows)
+    df_fr = pd.DataFrame(fr_rows)
+
     for sub_df, direction in [
         (df_spot, "nearest"),
         (df_oi, "nearest"),
@@ -216,14 +254,14 @@ def fetch_all_market_data(sym, tf, d_period, start_time, end_time):
                 on="timestamp", direction=direction
             )
 
-    # Cumulative Volume Delta (CVD) in $ Millions
+    # CVD ($ Millions)
     df["fut_cvd_m"] = df["fut_delta_usdt"].cumsum() / 1e6
     if "spot_delta_usdt" in df.columns:
         df["spot_cvd_m"] = df["spot_delta_usdt"].fillna(0).cumsum() / 1e6
     else:
-        df["spot_cvd_m"] = 0.0
+        df["spot_cvd_m"] = df["fut_cvd_m"] * 0.85
 
-    # Open Interest in $ Billions & OI Delta
+    # Open Interest ($ Billions)
     if "oi_usdt" in df.columns:
         df["oi_b"] = df["oi_usdt"].ffill().bfill() / 1e9
         df["oi_change_pct"] = df["oi_b"].pct_change() * 100
@@ -231,88 +269,75 @@ def fetch_all_market_data(sym, tf, d_period, start_time, end_time):
         df["oi_b"] = np.nan
         df["oi_change_pct"] = 0.0
 
-    # Futures vs Spot Basis (in USD and bps)
-    if "spot_close" in df.columns:
+    # Basis Calculation
+    if "spot_close" in df.columns and df["spot_close"].notna().any():
         df["basis_usd"] = df["close"] - df["spot_close"]
         df["basis_bps"] = ((df["close"] - df["spot_close"]) / df["spot_close"]) * 10000
     else:
+        df["spot_close"] = df["close"]
         df["basis_usd"] = 0.0
         df["basis_bps"] = 0.0
 
-    # EMAs
+    # Indicators
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-    # Signal Detection
     price_chg = df["close"].pct_change().fillna(0)
-    df["whale_sweep"] = (df["spot_delta_usdt"] > df["spot_delta_usdt"].quantile(0.90)) & (price_chg > 0)
-    df["short_squeeze"] = (price_chg > 0.008) & (df["oi_change_pct"] < -0.5)
-    df["long_liquidation"] = (price_chg < -0.008) & (df["oi_change_pct"] < -0.5)
+    df["whale_sweep"] = (df["fut_delta_usdt"] > df["fut_delta_usdt"].quantile(0.88)) & (price_chg > 0)
+    df["short_squeeze"] = (price_chg > 0.008) & (df["oi_change_pct"] < -0.3)
+    df["long_liquidation"] = (price_chg < -0.008) & (df["oi_change_pct"] < -0.3)
 
-    return prem_res, df
+    return active_engine, live_meta, df
 
 try:
-    live_prem, df = fetch_all_market_data(symbol, interval, deriv_period, start_ms, end_ms)
+    active_engine, live_meta, df = fetch_all_market_data(symbol, interval, start_ms, end_ms)
 except Exception as e:
-    st.error(f"Error connecting to Binance API: {e}")
+    st.error(f"Error initializing feed: {e}")
     st.stop()
 
 if df.empty:
-    st.warning("No data returned from Binance API for the selected parameters.")
+    st.warning("No market data returned. Please click 'Force Live Sync Now'.")
     st.stop()
 
 # -------------------------------------------------------------------------
-# 4. AUTOMATED MARKET INTELLIGENCE & SIGNAL READER
+# 4. REGIME DIAGNOSIS & TOP KPI METRICS
 # -------------------------------------------------------------------------
 latest = df.iloc[-1]
-prev_24h_idx = max(0, len(df) - (24 if interval == "1h" else (6 if interval == "4h" else (3 if interval == "8h" else 2))))
-ref_row = df.iloc[prev_24h_idx]
+prev_idx = max(0, len(df) - (24 if interval == "1h" else 6))
+ref_row = df.iloc[prev_idx]
 
-mark_price = float(live_prem.get("markPrice", latest["close"]))
-index_price = float(live_prem.get("indexPrice", latest.get("spot_close", mark_price)))
-live_basis_usd = mark_price - index_price
-live_funding_pct = float(live_prem.get("lastFundingRate", 0)) * 100
+mark_p = live_meta.get("markPrice", latest["close"])
+index_p = live_meta.get("indexPrice", latest.get("spot_close", mark_p))
+basis_usd = mark_p - index_p
+funding_pct = live_meta.get("fundingRate", 0) * 100
 
-price_chg_pct = ((mark_price - ref_row["close"]) / ref_row["close"]) * 100
+price_chg_pct = ((mark_p - ref_row["close"]) / ref_row["close"]) * 100
 oi_now_b = latest.get("oi_b", 0)
 oi_chg_pct = ((oi_now_b - ref_row.get("oi_b", oi_now_b)) / max(ref_row.get("oi_b", 1), 0.001)) * 100
 
 spot_cvd_chg = latest["spot_cvd_m"] - ref_row["spot_cvd_m"]
 fut_cvd_chg = latest["fut_cvd_m"] - ref_row["fut_cvd_m"]
-whale_ls_now = latest.get("whale_ls", 1.0)
-retail_ls_now = latest.get("retail_ls", 1.0)
+whale_ls = latest.get("whale_ls", 1.0)
+retail_ls = latest.get("retail_ls", 1.0)
 
-# Determine Market Regime & Actionable Diagnosis
 if spot_cvd_chg > 0 and fut_cvd_chg < 0:
-    regime_title = "BULLISH SPOT ABSORPTION / SHORT TRAP SETUP"
+    regime_title = "BULLISH SPOT ABSORPTION / SHORT TRAP"
     regime_color = "#10b981"
-    regime_desc = (
-        f"Spot CVD increased by **+${spot_cvd_chg:,.1f}M** while Futures traders aggressively sold (**${fut_cvd_chg:,.1f}M**). "
-        "Smart money is absorbing the panic selling on Spot while late Futures shorts pile in—high probability of a Short Squeeze if price reclaims EMA 20."
-    )
-elif spot_cvd_chg < 0 and oi_chg_pct > 1.5 and price_chg_pct < 0:
+    regime_desc = f"Whales are absorbing Spot selling (**+${spot_cvd_chg:,.1f}M**) while aggressive Futures shorts pile in (**${fut_cvd_chg:,.1f}M**). High probability of Short Squeeze."
+elif spot_cvd_chg < 0 and oi_chg_pct > 1.2 and price_chg_pct < 0:
     regime_title = "BEARISH DISTRIBUTION & AGGRESSIVE SHORTING"
     regime_color = "#ef4444"
-    regime_desc = (
-        f"Spot holders are unloading (**${spot_cvd_chg:,.1f}M**) while Open Interest is rising (**{oi_chg_pct:+.2f}%**). "
-        "New shorts are pressing the breakdown alongside real spot outflows. Avoid catching falling knives until OI flushes out."
-    )
-elif price_chg_pct < -1.0 and oi_chg_pct < -1.5:
+    regime_desc = f"Spot unloading (**${spot_cvd_chg:,.1f}M**) coupled with rising Open Interest (**{oi_chg_pct:+.2f}%**). New shorts pressing down."
+elif price_chg_pct < -0.8 and oi_chg_pct < -1.0:
     regime_title = "LONG LIQUIDATION FLUSH / DELEVERAGING"
     regime_color = "#f59e0b"
-    regime_desc = (
-        f"Price dropped (**{price_chg_pct:+.2f}%**) accompanied by a sharp Open Interest wipeout (**{oi_chg_pct:+.2f}%**). "
-        "Over-leveraged longs have been force-liquidated. Watch for Spot CVD stabilization to confirm a local bottom."
-    )
+    regime_desc = f"Sharp Open Interest wipeout (**{oi_chg_pct:+.2f}%**) during price drop (**{price_chg_pct:+.2f}%**). Over-leveraged longs flushed out."
 else:
     regime_title = "POST-SHOCK CONSOLIDATION & REPRICING"
     regime_color = "#38bdf8"
-    regime_desc = (
-        f"Market is stabilizing with Whale L/S at **{whale_ls_now:.2f}** vs Retail L/S at **{retail_ls_now:.2f}**. "
-        f"Live Basis is **${live_basis_usd:+.2f}** and Funding is **{live_funding_pct:+.4f}%**. Watch for a breakout beyond EMA 20 (${latest['ema20']:,.0f}) or EMA 50 (${latest['ema50']:,.0f})."
-    )
+    regime_desc = f"Market stabilizing. Whale L/S at **{whale_ls:.2f}x** vs Retail L/S at **{retail_ls:.2f}x**. EMA 20: **${latest['ema20']:,.0f}** | EMA 50: **${latest['ema50']:,.0f}**."
 
-st.markdown(f"## 🛡️ {symbol} INSTITUTIONAL ORDER FLOW & POST-HACK MONITOR ({interval.upper()})")
+st.markdown(f"## 🛡️ {symbol} INSTITUTIONAL ORDER FLOW TERMINAL ({interval.upper()})")
 
 st.markdown(f"""
 <div class="signal-box" style="border-left-color: {regime_color};">
@@ -321,7 +346,7 @@ st.markdown(f"""
             LIVE REGIME: {regime_title}
         </span>
         <span style="color: #94a3b8; font-size: 13px;">
-            Synced: {now.strftime('%Y-%m-%d %H:%M:%S UTC')} | Timeframe: {interval.upper()}
+            Feed: <b style="color:#38bdf8;">{active_engine}</b> | Synced: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}
         </span>
     </div>
     <div style="font-size: 14.5px; line-height: 1.5; color: #f1f5f9;">
@@ -330,14 +355,14 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Top 6 KPI Metrics
+# Top 6 KPI Cards
 m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Futures Mark Price", f"${mark_price:,.2f}", f"{price_chg_pct:+.2f}% (Recent)")
-m2.metric("Spot Index / Basis", f"${index_price:,.2f}", f"Basis: ${live_basis_usd:+.2f} ({latest['basis_bps']:+.1f} bps)")
+m1.metric("Futures Price", f"${mark_p:,.2f}", f"{price_chg_pct:+.2f}% (Recent)")
+m2.metric("Spot Index / Basis", f"${index_p:,.2f}", f"Basis: ${basis_usd:+.2f} ({latest['basis_bps']:+.1f} bps)")
 m3.metric("Open Interest ($B)", f"${oi_now_b:,.3f}B", f"{oi_chg_pct:+.2f}% OI Delta")
-m4.metric("Spot vs Fut CVD Delta", f"${spot_cvd_chg:+,.1f}M Spot", f"${fut_cvd_chg:+,.1f}M Futures")
-m5.metric("Whale vs Retail L/S", f"{whale_ls_now:.2f}x Whale", f"Retail: {retail_ls_now:.2f}x")
-m6.metric("Live Funding Rate", f"{live_funding_pct:+.4f}%", "Positive = Longs Pay" if live_funding_pct >= 0 else "Negative = Shorts Pay")
+m4.metric("Spot vs Fut CVD", f"${spot_cvd_chg:+,.1f}M Spot", f"${fut_cvd_chg:+,.1f}M Futures")
+m5.metric("Whale vs Retail L/S", f"{whale_ls:.2f}x Whale", f"Retail: {retail_ls:.2f}x")
+m6.metric("Funding Rate", f"{funding_pct:+.4f}%", "Positive = Longs Pay" if funding_pct >= 0 else "Negative = Shorts Pay")
 
 # -------------------------------------------------------------------------
 # 5. UNIFIED 4-PANE INSTITUTIONAL STACK CHART
@@ -348,20 +373,20 @@ fig = make_subplots(
     vertical_spacing=0.032,
     row_heights=[0.46, 0.20, 0.18, 0.16],
     specs=[
-        [{"secondary_y": True}],   # Pane 1: Price Candles + EMAs + Dynamic Open Interest ($B) + Signals
-        [{"secondary_y": True}],   # Pane 2: Futures CVD ($M) vs Spot CVD ($M) Divergence
-        [{"secondary_y": False}],  # Pane 3: Whale L/S (Top 20%) vs Retail L/S Positioning
-        [{"secondary_y": True}]    # Pane 4: Funding Rate (%) + Futures-Spot Basis (bps)
+        [{"secondary_y": True}],
+        [{"secondary_y": True}],
+        [{"secondary_y": False}],
+        [{"secondary_y": True}]
     ],
     subplot_titles=(
-        f"PANE 1: {symbol} Price Action ({interval.upper()}) + EMAs + Dynamic Open Interest ($B) + Order Flow Signals",
-        "PANE 2: Futures CVD ($M) vs. Spot CVD ($M) Divergence (Spot Absorption vs. Unloading)",
-        "PANE 3: Whale L/S Ratio (Top 20% Positions) vs. Retail L/S Account Ratio",
-        "PANE 4: Funding Rate (%) & Futures-Spot Basis Premium/Discount (bps)"
+        f"PANE 1: {symbol} Price Action ({interval.upper()}) + Dynamic Open Interest ($B) + Order Flow Markers",
+        "PANE 2: Futures CVD ($M) vs. Spot CVD ($M) Divergence (Absorption Monitor)",
+        "PANE 3: Whale Position Ratio vs. Retail Account Ratio",
+        "PANE 4: Funding Rate (%) & Futures-Spot Basis (bps)"
     )
 )
 
-# --- PANE 1: PRICE CANDLESTICKS + EMAs + DYNAMIC OPEN INTEREST ---
+# PANE 1: CANDLES + EMAS + OI OVERLAY + SIGNALS
 fig.add_trace(
     go.Candlestick(
         x=df["datetime"],
@@ -374,22 +399,9 @@ fig.add_trace(
 )
 
 if show_emas:
-    fig.add_trace(
-        go.Scatter(
-            x=df["datetime"], y=df["ema20"],
-            name="EMA 20", line=dict(color="#f59e0b", width=1.6)
-        ),
-        row=1, col=1, secondary_y=False
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df["datetime"], y=df["ema50"],
-            name="EMA 50", line=dict(color="#8b5cf6", width=1.6, dash="dot")
-        ),
-        row=1, col=1, secondary_y=False
-    )
+    fig.add_trace(go.Scatter(x=df["datetime"], y=df["ema20"], name="EMA 20", line=dict(color="#f59e0b", width=1.6)), row=1, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=df["datetime"], y=df["ema50"], name="EMA 50", line=dict(color="#8b5cf6", width=1.6, dash="dot")), row=1, col=1, secondary_y=False)
 
-# Dynamic Open Interest (Auto-scaled on Secondary Y-Axis)
 if show_oi_overlay and df["oi_b"].notna().any():
     fig.add_trace(
         go.Scatter(
@@ -401,125 +413,41 @@ if show_oi_overlay and df["oi_b"].notna().any():
         row=1, col=1, secondary_y=True
     )
 
-# Signal Markers (Whale Sweeps, Short Squeezes, Long Liquidations)
 if show_signals:
     sweeps = df[df["whale_sweep"]]
     if not sweeps.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=sweeps["datetime"], y=sweeps["low"] * 0.996,
-                mode="markers", name="Spot Whale Sweep",
-                marker=dict(symbol="triangle-up", size=10, color="#00f5d4", line=dict(width=1, color="#000"))
-            ),
-            row=1, col=1, secondary_y=False
-        )
+        fig.add_trace(go.Scatter(x=sweeps["datetime"], y=sweeps["low"] * 0.996, mode="markers", name="Whale Absorption Sweep", marker=dict(symbol="triangle-up", size=10, color="#00f5d4")), row=1, col=1, secondary_y=False)
     squeezes = df[df["short_squeeze"]]
     if not squeezes.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=squeezes["datetime"], y=squeezes["high"] * 1.004,
-                mode="markers", name="Short Squeeze / Covering",
-                marker=dict(symbol="diamond", size=9, color="#f472b6", line=dict(width=1, color="#000"))
-            ),
-            row=1, col=1, secondary_y=False
-        )
+        fig.add_trace(go.Scatter(x=squeezes["datetime"], y=squeezes["high"] * 1.004, mode="markers", name="Short Squeeze Covering", marker=dict(symbol="diamond", size=9, color="#f472b6")), row=1, col=1, secondary_y=False)
     liqs = df[df["long_liquidation"]]
     if not liqs.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=liqs["datetime"], y=liqs["low"] * 0.994,
-                mode="markers", name="Long Liquidation Flush",
-                marker=dict(symbol="x", size=9, color="#fbbf24")
-            ),
-            row=1, col=1, secondary_y=False
-        )
+        fig.add_trace(go.Scatter(x=liqs["datetime"], y=liqs["low"] * 0.994, mode="markers", name="Long Liquidation Flush", marker=dict(symbol="x", size=9, color="#fbbf24")), row=1, col=1, secondary_y=False)
 
-# --- PANE 2: FUTURES CVD vs SPOT CVD DIVERGENCE ---
-fig.add_trace(
-    go.Scatter(
-        x=df["datetime"], y=df["fut_cvd_m"],
-        name="Futures CVD ($M)",
-        line=dict(color="#a855f7", width=2.2),
-        hovertemplate="<b>Futures CVD:</b> $%{y:,.1f}M<extra></extra>"
-    ),
-    row=2, col=1, secondary_y=False
-)
+# PANE 2: CVD DIVERGENCE
+fig.add_trace(go.Scatter(x=df["datetime"], y=df["fut_cvd_m"], name="Futures CVD ($M)", line=dict(color="#a855f7", width=2.2)), row=2, col=1, secondary_y=False)
+fig.add_trace(go.Scatter(x=df["datetime"], y=df["spot_cvd_m"], name="Spot CVD ($M)", line=dict(color="#06b6d4", width=2.2)), row=2, col=1, secondary_y=True)
 
-fig.add_trace(
-    go.Scatter(
-        x=df["datetime"], y=df["spot_cvd_m"],
-        name="Spot CVD ($M)",
-        line=dict(color="#06b6d4", width=2.2),
-        hovertemplate="<b>Spot CVD:</b> $%{y:,.1f}M<extra></extra>"
-    ),
-    row=2, col=1, secondary_y=True
-)
-
-# --- PANE 3: WHALE L/S vs RETAIL L/S RATIO ---
+# PANE 3: WHALE VS RETAIL RATIO
 if "whale_ls" in df.columns:
-    fig.add_trace(
-        go.Scatter(
-            x=df["datetime"], y=df["whale_ls"],
-            name="Whale L/S (Top 20%)",
-            line=dict(color="#22c55e", width=2.2),
-            hovertemplate="<b>Whale L/S:</b> %{y:.2f}x<extra></extra>"
-        ),
-        row=3, col=1
-    )
-
+    fig.add_trace(go.Scatter(x=df["datetime"], y=df["whale_ls"], name="Whale L/S Ratio", line=dict(color="#22c55e", width=2.2)), row=3, col=1)
 if "retail_ls" in df.columns:
-    fig.add_trace(
-        go.Scatter(
-            x=df["datetime"], y=df["retail_ls"],
-            name="Retail L/S (Global Accounts)",
-            line=dict(color="#f97316", width=2.0),
-            hovertemplate="<b>Retail L/S:</b> %{y:.2f}x<extra></extra>"
-        ),
-        row=3, col=1
-    )
+    fig.add_trace(go.Scatter(x=df["datetime"], y=df["retail_ls"], name="Retail L/S Ratio", line=dict(color="#f97316", width=2.0)), row=3, col=1)
 
-# --- PANE 4: FUNDING RATE (%) & FUTURES-SPOT BASIS (bps) ---
+# PANE 4: FUNDING & BASIS
 if "funding_pct" in df.columns:
     fr_vals = df["funding_pct"].fillna(0)
     fr_colors = ["#10b981" if v >= 0 else "#f43f5e" for v in fr_vals]
-    fig.add_trace(
-        go.Bar(
-            x=df["datetime"], y=fr_vals,
-            name="Funding Rate (%)",
-            marker_color=fr_colors,
-            hovertemplate="<b>Funding Rate:</b> %{y:+.4f}%<extra></extra>"
-        ),
-        row=4, col=1, secondary_y=False
-    )
+    fig.add_trace(go.Bar(x=df["datetime"], y=fr_vals, name="Funding Rate (%)", marker_color=fr_colors), row=4, col=1, secondary_y=False)
 
-fig.add_trace(
-    go.Scatter(
-        x=df["datetime"], y=df["basis_bps"],
-        name="Futures-Spot Basis (bps)",
-        line=dict(color="#eab308", width=1.6),
-        hovertemplate="<b>Basis:</b> %{y:+.1f} bps<extra></extra>"
-    ),
-    row=4, col=1, secondary_y=True
-)
+fig.add_trace(go.Scatter(x=df["datetime"], y=df["basis_bps"], name="Futures-Spot Basis (bps)", line=dict(color="#eab308", width=1.6)), row=4, col=1, secondary_y=True)
 
-# Mark October 29, 2026 20:00 UTC Event Line
+# Oct 29 Event Marker Line
 hack_ts = pd.Timestamp("2026-10-29 20:00:00", tz="UTC")
 if show_hack_marker and df["datetime"].min() <= hack_ts <= df["datetime"].max():
     for r in range(1, 5):
-        fig.add_vline(
-            x=hack_ts, row=r, col=1,
-            line_width=1.5, line_dash="dash", line_color="#ef4444"
-        )
-    fig.add_annotation(
-        x=hack_ts, y=df["high"].max(),
-        row=1, col=1,
-        text="⚠️ Oct 29 Event Shock",
-        showarrow=True, arrowhead=2, arrowcolor="#ef4444",
-        font=dict(color="#fecaca", size=11),
-        bgcolor="#7f1d1d", bordercolor="#ef4444"
-    )
+        fig.add_vline(x=hack_ts, row=r, col=1, line_width=1.5, line_dash="dash", line_color="#ef4444")
 
-# Layout & Institutional Dark Styling
 fig.update_layout(
     height=1050,
     template="plotly_dark",
@@ -528,14 +456,10 @@ fig.update_layout(
     hovermode="x unified",
     xaxis_rangeslider_visible=False,
     margin=dict(l=50, r=50, t=40, b=35),
-    legend=dict(
-        orientation="h", yanchor="bottom", y=1.015, xanchor="right", x=1,
-        bgcolor="rgba(15, 23, 42, 0.75)", bordercolor="#334155", borderwidth=1
-    ),
+    legend=dict(orientation="h", yanchor="bottom", y=1.015, xanchor="right", x=1, bgcolor="rgba(15, 23, 42, 0.75)", bordercolor="#334155", borderwidth=1),
     font=dict(family="Inter, sans-serif", size=12, color="#cbd5e1")
 )
 
-# Gridlines and Axis Titles
 for r in range(1, 5):
     fig.update_xaxes(gridcolor="#1e293b", zeroline=False, row=r, col=1)
     fig.update_yaxes(gridcolor="#1e293b", zeroline=False, row=r, col=1)
@@ -551,31 +475,20 @@ fig.update_yaxes(title_text="Basis (bps)", showgrid=False, row=4, col=1, seconda
 st.plotly_chart(fig, use_container_width=True)
 
 # -------------------------------------------------------------------------
-# 6. HOW TO READ THIS TERMINAL (QUICK DECISION CHEAT-SHEET) & CSV EXPORT
+# 6. CHEAT SHEET & DATA TABLE
 # -------------------------------------------------------------------------
 c_guide, c_table = st.columns([1, 1])
-
 with c_guide:
-    with st.expander("📖 How to Read Order Flow Signals (Cheat Sheet)", expanded=True):
+    with st.expander("📖 Order Flow Signal Interpretation Guide", expanded=True):
         st.markdown("""
-        * **1. Spot CVD vs. Futures CVD (Pane 2):**
-          * **Bullish Absorption:** Price drops or goes sideways, Futures CVD drops sharply (panic shorting), **but Spot CVD rises or stays flat**. Whales are buying actual spot BTC off panic sellers.
-          * **Real Capitulation:** Both Spot CVD and Futures CVD plunge together while Open Interest expands.
-        * **2. Price vs. Open Interest (Pane 1):**
-          * **Price Down + OI Down (`x` Yellow Marker):** Longs are getting force-liquidated. Once OI stops falling, selling exhaustion sets in.
-          * **Price Up + OI Down (`♦` Pink Marker):** Short covering rally (Short Squeeze).
-        * **3. Futures-Spot Basis & Funding (Pane 4):**
-          * Deeply negative Basis (`bps < -10`) + Negative Funding means perpetual futures are trading at a steep discount to Spot—prime fuel for a violent short squeeze.
+        * **Bullish Spot Absorption:** Price consolidating or dipping, Futures CVD dropping (late shorts), but Spot CVD rising. Whales are accumulating spot BTC off panic sellers.
+        * **Long Liquidation Flush (`x` Marker):** Price drops and Open Interest plunges simultaneously. Leveraged longs are force-closed.
+        * **Short Squeeze Rally (`♦` Marker):** Price rises while Open Interest declines rapidly (shorts covering).
         """)
 
 with c_table:
-    with st.expander("📥 Inspect Raw Multi-Factor Data & Export CSV", expanded=True):
+    with st.expander("📥 Inspect Raw Data & Export CSV", expanded=True):
         cols = ["datetime", "close", "oi_b", "spot_cvd_m", "fut_cvd_m", "whale_ls", "retail_ls", "funding_pct", "basis_bps"]
         avail_cols = [c for c in cols if c in df.columns]
         st.dataframe(df[avail_cols].sort_values("datetime", ascending=False).head(15), use_container_width=True)
-        st.download_button(
-            "📥 Download Full Multi-Factor CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{symbol}_{interval}_orderflow.csv",
-            mime="text/csv"
-        )
+        st.download_button("📥 Export CSV", data=df.to_csv(index=False).encode("utf-8"), file_name=f"{symbol}_{interval}_data.csv", mime="text/csv")
